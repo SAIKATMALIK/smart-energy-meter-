@@ -1,0 +1,161 @@
+// Hardware Configuration
+const int PHASE_PIN = 34;
+const int NEUTRAL_PIN = 35;
+const int relayPin = 15;
+
+// Sensor Settings
+const float SENSITIVITY = 0.042; // ACS712-30A sensitivity (V/A)
+const float VCC = 5.0;
+const float ESP_ADC_REF = 3.3;
+const int ADC_MAX = 4095;
+
+// Measurement Settings
+const int SAMPLES = 100; // Fast but accurate sampling
+const float NOISE_FLOOR = 0.020; // Increased to prevent false readings
+const float CORRECTION_FACTOR = 0.344;
+
+// Calibration Variables
+float phaseOffsetV = 0;
+float neutralOffsetV = 0;
+
+// Trip Settings
+const float LEAKAGE_THRESHOLD = 0.300; // 300mA leakage threshold
+const float MIN_OPERATING_CURRENT = 0.100; // 100mA minimum current
+const unsigned long TRIP_VERIFICATION_TIME = 50; // 50ms verification
+const unsigned long AUTO_RESET_DELAY = 3000; // 3s delay before auto-reset
+const unsigned long RETRY_INTERVAL = 5000; // 5s between auto-retries
+
+// System State
+bool isTripped = false;
+bool faultConfirmed = false;
+unsigned long tripTime = 0;
+unsigned long lastCurrentDetection = 0;
+unsigned long lastRetryAttempt = 0;
+
+void setup() {
+  Serial.begin(115200);
+  pinMode(relayPin, OUTPUT);
+  digitalWrite(relayPin, LOW);
+  
+  Serial.println("\nStarting Smart Ground Fault Protector");
+  calibrateSensors();
+  
+  Serial.println("System Ready");
+  Serial.println("Phase\tNeutral\tLeakage\tStatus");
+}
+
+void loop() {
+  // Read and process currents
+  float phaseI = getRMSCurrent(PHASE_PIN) * CORRECTION_FACTOR;
+  float neutralI = getRMSCurrent(NEUTRAL_PIN) * CORRECTION_FACTOR;
+  
+  // Apply noise floor
+  phaseI = (phaseI < NOISE_FLOOR) ? 0 : phaseI;
+  neutralI = (neutralI < NOISE_FLOOR) ? 0 : neutralI;
+  float leakage = abs(phaseI - neutralI);
+  leakage = (leakage < NOISE_FLOOR*1.5) ? 0 : leakage;
+
+  // Current presence detection
+  bool currentPresent = (phaseI > MIN_OPERATING_CURRENT || 
+                        neutralI > MIN_OPERATING_CURRENT);
+
+  // State machine
+  if (!isTripped) {
+    // Normal operation - check for faults
+    if (leakage > LEAKAGE_THRESHOLD) {
+      if (!faultConfirmed) {
+        if (tripTime == 0) {
+          tripTime = millis();
+        } else if (millis() - tripTime > TRIP_VERIFICATION_TIME) {
+          faultConfirmed = true;
+          tripRelay();
+        }
+      }
+    } else {
+      tripTime = 0;
+      faultConfirmed = false;
+    }
+  } else {
+    // Tripped state - check for auto-reset conditions
+    if (!currentPresent) {
+      if (millis() - lastCurrentDetection > AUTO_RESET_DELAY) {
+        resetSystem();
+      }
+    } else {
+      lastCurrentDetection = millis();
+      
+      // Periodic retry to check if fault cleared
+      if (millis() - lastRetryAttempt > RETRY_INTERVAL) {
+        lastRetryAttempt = millis();
+        if (leakage < LEAKAGE_THRESHOLD * 0.8) { // 80% of threshold for hysteresis
+          resetSystem();
+        }
+      }
+    }
+  }
+
+  // Status reporting
+  static unsigned long lastPrint = 0;
+  if (millis() - lastPrint >= 500) {
+    Serial.print(phaseI, 3); Serial.print("\t");
+    Serial.print(neutralI, 3); Serial.print("\t");
+    Serial.print(leakage, 3); Serial.print("\t");
+    
+    if (isTripped) {
+      Serial.print("TRIPPED");
+      if (!faultConfirmed) Serial.print(" (Retrying)");
+      if (!currentPresent) {
+        Serial.print(" (Auto-reset in ");
+        Serial.print((AUTO_RESET_DELAY - (millis() - lastCurrentDetection))/1000);
+        Serial.print("s)");
+      }
+    } else {
+      Serial.print("NORMAL");
+      if (faultConfirmed) Serial.print(" (Fault Detected)");
+    }
+    Serial.println();
+    lastPrint = millis();
+  }
+}
+
+void calibrateSensors() {
+  const int CAL_SAMPLES = 300;
+  float phaseSum = 0, neutralSum = 0;
+  
+  for (int i = 0; i < CAL_SAMPLES; i++) {
+    phaseSum += analogRead(PHASE_PIN);
+    neutralSum += analogRead(NEUTRAL_PIN);
+    delay(1);
+  }
+  
+  phaseOffsetV = (phaseSum / CAL_SAMPLES) * (ESP_ADC_REF / ADC_MAX);
+  neutralOffsetV = (neutralSum / CAL_SAMPLES) * (ESP_ADC_REF / ADC_MAX);
+}
+
+float getRMSCurrent(int pin) {
+  float sumSq = 0;
+  for (int i = 0; i < SAMPLES; i++) {
+    float sensorV = analogRead(pin) * (ESP_ADC_REF / ADC_MAX);
+    float current = (sensorV - (pin == PHASE_PIN ? phaseOffsetV : neutralOffsetV)) 
+                   * (VCC / ESP_ADC_REF) / SENSITIVITY;
+    sumSq += current * current;
+    delayMicroseconds(100);
+  }
+  return sqrt(sumSq / SAMPLES);
+}
+
+void tripRelay() {
+  digitalWrite(relayPin, HIGH);
+  isTripped = true;
+  tripTime = millis();
+  lastCurrentDetection = millis();
+  Serial.println("!FAULT DETECTED - RELAY TRIPPED!");
+}
+
+void resetSystem() {
+  digitalWrite(relayPin, LOW);
+  isTripped = false;
+  faultConfirmed = false;
+  tripTime = 0;
+  Serial.println("SYSTEM RESET - Relay re-engaged");
+}
