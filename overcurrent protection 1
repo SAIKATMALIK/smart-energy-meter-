@@ -1,3 +1,7 @@
+//overcurrent protection for each room.
+
+
+
 // Hardware Configuration
 const int CURRENT_PIN = 34;      // ACS712 connected to GPIO34
 const int RELAY_PIN = 15;        // Relay control pin
