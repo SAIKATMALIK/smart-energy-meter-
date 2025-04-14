@@ -1,0 +1,44 @@
+#include <Wire.h>
+#include <ZMPT101B.h>
+
+#define SENSITIVITY 500.0f       // Adjust this value to calibrate sensitivity (can be 500, 1000, etc. based on your sensor)
+#define CALIBRATION_FACTOR 1.49  // Calibration factor to correct the reading (230 / 155 or adjust according to your testing)
+int numberofovervoltage = 0;
+ZMPT101B voltageSensor(27, 50.0);
+int RELAY_PIN = 18;
+
+void setup() {
+  pinMode(RELAY_PIN, OUTPUT);  // Set RELAY_PIN as OUTPUT
+  digitalWrite(RELAY_PIN, LOW);  // Ensure relay is initially off
+  Serial.begin(115200);
+  voltageSensor.setSensitivity(SENSITIVITY);
+  Serial.println("ZMPT Calibration Started");
+}
+
+void voltagecheck() {
+  float voltage = voltageSensor.getRmsVoltage() * CALIBRATION_FACTOR;  // Apply calibration factor
+
+  return voltage;  // Call overvoltage function to check and trigger relay if needed
+}
+
+void loop() {
+  overVoltage ();
+  delay(200);  // Delay to avoid flooding the serial output
+}
+
+void overVoltage() {
+  float voltage = voltageCheck();
+  if (voltage > 280) {  // If the voltage is greater than 280V, activate the relay
+    digitalWrite(RELAY_PIN, HIGH); 
+    numberofovervoltage = numberofovervoltage + 1; // Increment overvoltage count
+  } else {
+    digitalWrite(RELAY_PIN, LOW);  // Otherwise, keep relay off
+  }
+}
+
+void display()
+{
+   float voltage = voltagecheck();
+   String message = "Ac Voltage :"+ String(voltage) + "V";
+   Serial.println(message);
+}
