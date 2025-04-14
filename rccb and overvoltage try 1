@@ -1,0 +1,97 @@
+#include <Wire.h>
+#include <ZMPT101B.h>
+
+#define ZMPT_PIN 27
+#define ZMPT_SENSITIVITY 500.0f
+#define CALIBRATION_FACTOR 1.49
+
+#define EARTHRELAY_PIN 15
+#define ZMCT_PHASE_PIN 34
+#define ZMCT_NEUTRAL_PIN 35
+#define RELAY_PIN 18
+
+#define OVERVOLTAGE_LIMIT 280.0
+#define LEAKAGE_THRESHOLD 0.05  // Amps
+
+ZMPT101B voltageSensor(ZMPT_PIN, 50.0);
+int overvoltageCount = 0;
+
+void setup() {
+  Serial.begin(115200);
+
+  pinMode(RELAY_PIN, OUTPUT);
+  pinMode(EARTHRELAY_PIN, OUTPUT);
+  
+  digitalWrite(RELAY_PIN, LOW);
+  digitalWrite(EARTHRELAY_PIN, LOW);
+  
+  voltageSensor.setSensitivity(ZMPT_SENSITIVITY);
+
+  Serial.println("System Initialized");
+}
+
+void loop() {
+  float voltage = readVoltage();
+  float currentPhase = readCurrent(ZMCT_PHASE_PIN);
+  float currentNeutral = readCurrent(ZMCT_NEUTRAL_PIN);
+
+  Serial.print("Voltage: "); Serial.print(voltage); Serial.print(" V, ");
+  Serial.print("Phase Current: "); Serial.print(currentPhase); Serial.print(" A, ");
+  Serial.print("Neutral Current: "); Serial.println(currentNeutral); Serial.println(" A");
+  handleOvervoltage(voltage);
+  RCCB(currentPhase, currentNeutral);
+  delay(500);
+}
+
+float readVoltage() {
+  return voltageSensor.getRmsVoltage() * CALIBRATION_FACTOR;
+}//voltage reading
+
+float readCurrent(int pin) {
+
+  int maxValue = 0;
+  int minValue = 4095;
+  unsigned long start = millis();
+
+  while (millis() - start < 100) {
+    int val = analogRead(pin);
+    if (val > maxValue) maxValue = val;
+    if (val < minValue) minValue = val;
+  }
+
+  float amplitude = (maxValue - minValue) / 2.0;
+  float voltage = (amplitude * 3.3) / 4095.0;
+  float current = voltage / 0.066; // 66mV/A for ZMCT103C
+
+  return current;
+}//current reading 
+
+void handleOvervoltage(float voltage) {
+  if (voltage > OVERVOLTAGE_LIMIT) {
+    digitalWrite(RELAY_PIN, HIGH);
+    overvoltageCount++;
+    Serial.println("⚠️ Overvoltage! Relay Turned ON");
+  } else {
+    digitalWrite(RELAY_PIN, LOW);
+  }
+}//overvoltage detection
+
+
+
+
+
+
+void RCCB(float currentPhase, float currentNeutral) {
+  float diff = abs(currentPhase - currentNeutral);
+  if (diff > LEAKAGE_THRESHOLD) {
+    Serial.println("⚠️ Leakage Detected!");
+    earthfaultrealytrip();
+  }
+}//rccb protection system
+
+void earthfaultrealytrip() {
+  digitalWrite(EARTHRELAY_PIN, HIGH);
+  Serial.println("⚡ Earth fault occurred. Earth Relay Turned ON");
+}// relay trip logic 
+
+
