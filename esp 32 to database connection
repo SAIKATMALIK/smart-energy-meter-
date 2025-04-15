@@ -1,0 +1,164 @@
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <ArduinoJson.h>
+#include <ZMPT101B.h>
+
+// 🔌 WiFi credentials
+#define WIFI_SSID "JARVIS"
+#define WIFI_PASSWORD "16112003"
+
+// 🔥 Firebase credentials
+#define FIREBASE_HOST "smart-energy-meter-29c17-default-rtdb.firebaseio.com"
+#define FIREBASE_AUTH "dL3Y2Bb2L7hzwzG2K8oehiNn4aaKx2rtmffJ3FR0"
+
+// 🔧 Pins and Settings
+#define ZMPT_PIN 27
+#define ZMPT_SENSITIVITY 500.0f
+#define CALIBRATION_FACTOR 1.49
+#define ZMCT_PHASE_PIN 34
+#define ZMCT_NEUTRAL_PIN 35
+#define RELAY_PIN 18
+#define EARTHRELAY_PIN 15
+
+#define OVERVOLTAGE_LIMIT 280.0
+#define UNDERVOLTAGE_LIMIT 150.0
+#define LEAKAGE_THRESHOLD 0.05  // Amps
+
+// 📊 Variables
+int overvoltageCount = 0;
+int undervoltageCount = 0;
+bool earthfault=0;
+
+ZMPT101B voltageSensor(ZMPT_PIN, 50.0);
+
+// 🛜 WiFi and Setup
+void setup() {
+  Serial.begin(115200);
+
+  pinMode(RELAY_PIN, OUTPUT);
+  pinMode(EARTHRELAY_PIN, OUTPUT);
+  digitalWrite(RELAY_PIN, LOW);
+  digitalWrite(EARTHRELAY_PIN, LOW);
+
+  voltageSensor.setSensitivity(ZMPT_SENSITIVITY);
+//wifi connect code here
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  Serial.print("Connecting to WiFi");
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println("\n✅ Connected to WiFi!");
+}
+
+void loop() {
+  float voltage = readVoltage();
+  float currentPhase = readCurrent(ZMCT_PHASE_PIN);
+  float currentNeutral = readCurrent(ZMCT_NEUTRAL_PIN);
+
+  Serial.print("Voltage: "); Serial.print(voltage); Serial.print(" V, ");
+  Serial.print("Phase Current: "); Serial.print(currentPhase); Serial.print(" A, ");
+  Serial.print("Neutral Current: "); Serial.println(currentNeutral);
+
+  // 🔁 Send to Firebase
+  sendToFirebase("/Voltage", voltage, FIREBASE_HOST, FIREBASE_AUTH);
+  sendToFirebase("/PhaseCurrent", currentPhase, FIREBASE_HOST, FIREBASE_AUTH);
+  sendToFirebase("/NeutralCurrent", currentNeutral, FIREBASE_HOST, FIREBASE_AUTH);
+ sendToFirebase("/earthfault", earthfault, FIREBASE_HOST, FIREBASE_AUTH);//it is creating a earthfault storage at firebase and sending data to it 
+  // ⚡ Protection
+  handleOvervoltage(voltage);
+  handleUndervoltage(voltage);
+  RCCB(currentPhase, currentNeutral);
+
+  delay(1000);
+}
+
+// ✅ Firebase Send Function
+bool sendToFirebase(const char* path, float value, const char* host, const char* auth) {
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("WiFi not connected");
+    return false;
+  }
+
+  HTTPClient http;
+  String url = "https://" + String(host) + path + ".json?auth=" + String(auth);
+  String payload = String(value, 2);  // round to 2 decimal places// this is the data in string format 
+
+  http.begin(url);
+  http.addHeader("Content-Type", "application/json");
+
+  int httpCode = http.PUT(payload);//returns the status code 
+
+  if (httpCode == HTTP_CODE_OK) {
+    Serial.print("✅ Sent "); Serial.print(path); Serial.print(": ");
+    Serial.println(payload);
+    http.end();
+    return true;
+  } else {
+    Serial.print("❌ Failed to send "); Serial.println(path);
+    http.end();
+    return false;
+  }
+}
+
+// 📐 Voltage Reading
+float readVoltage() {
+  return voltageSensor.getRmsVoltage() * CALIBRATION_FACTOR;
+}
+
+// ⚡ Current Reading
+float readCurrent(int pin) {
+  int maxVal = 0, minVal = 4095;
+  unsigned long start = millis();
+
+  while (millis() - start < 100) {
+    int val = analogRead(pin);
+    maxVal = max(maxVal, val);
+    minVal = min(minVal, val);
+  }
+
+  float amplitude = (maxVal - minVal) / 2.0;
+  float voltage = (amplitude * 3.3) / 4095.0;
+  return voltage / 0.066;  // For ZMCT103C
+}
+
+// ⚠️ Overvoltage Protection
+void handleOvervoltage(float voltage) {
+  if (voltage > OVERVOLTAGE_LIMIT) {
+    digitalWrite(RELAY_PIN, HIGH);
+    overvoltageCount++;
+    Serial.println("⚠️ Overvoltage! Relay Turned ON");
+    sendToFirebase("/OvervoltageCount", overvoltageCount, FIREBASE_HOST, FIREBASE_AUTH);
+  } else {
+    digitalWrite(RELAY_PIN, LOW);
+  }
+}
+
+// ⚠️ Undervoltage Protection
+void handleUndervoltage(float voltage) {
+  if (voltage < UNDERVOLTAGE_LIMIT) {
+    digitalWrite(RELAY_PIN, HIGH);
+    undervoltageCount++;
+    Serial.println("⚠️ Undervoltage! Relay Tripped");
+    sendToFirebase("/UndervoltageCount", undervoltageCount, FIREBASE_HOST, FIREBASE_AUTH);
+  } else {
+    digitalWrite(RELAY_PIN, LOW);
+  }
+}
+
+// ⚠️ RCCB - Earth Leakage Detection
+void RCCB(float currentPhase, float currentNeutral) {
+  float diff = abs(currentPhase - currentNeutral);
+  if (diff > LEAKAGE_THRESHOLD) {
+    Serial.println("⚠️ Leakage Detected!");
+    earthfaultRelayTrip();
+    sendToFirebase("/LeakageCurrent", diff, FIREBASE_HOST, FIREBASE_AUTH);
+  }
+}
+
+// ⚡ Earth Fault Trip
+void earthfaultRelayTrip() {
+  digitalWrite(EARTHRELAY_PIN, HIGH);
+  earthfault=1;
+  Serial.println("⚡ Earth fault occurred. Earth Relay Turned ON");
+}
