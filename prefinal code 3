@@ -1,0 +1,338 @@
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <ArduinoJson.h>
+#include <ZMPT101B.h>
+
+#define WIFI_SSID "JARVIS"
+#define WIFI_PASSWORD "16112003"
+#define FIREBASE_HOST "electrostat-86370-default-rtdb.asia-southeast1.firebasedatabase.app"
+#define FIREBASE_AUTH "dL3Y2Bb2L7hzwzG2K8oehiNn4aaKx2rtmffJ3FR0"
+
+// Voltage sensor (ZMPT101B)
+#define ZMPT_PIN 33
+#define ZMPT_SENSITIVITY 500.0f
+#define CALIBRATION_FACTOR 1.49
+
+// ZMCT current sensors
+#define ZMCT_PHASE_PIN 36
+#define ZMCT_NEUTRAL_PIN 39
+
+// ACS712 current sensors
+#define ROOM1CURRENTSENSOR 34 // Kitchen
+#define ROOM2CURRENTSENSOR 35 // Living
+#define ROOM3CURRENTSENSOR 32 // Office
+
+// Relays
+#define RELAY_PIN 18
+#define EARTHRELAY_PIN 15
+#define ROOM1_RELAY_PIN 26
+#define ROOM2_RELAY_PIN 27
+#define ROOM3_RELAY_PIN 14
+
+// Thresholds
+#define OVERVOLTAGE_LIMIT 280.0
+#define UNDERVOLTAGE_LIMIT 150.0
+#define LEAKAGE_THRESHOLD 0.05
+
+
+int overvoltageCount = 0;
+int undervoltageCount = 0;
+bool earthfault = false;
+bool powerstatus = true;
+bool online = 0;
+
+float zeroKitchen = 1.65;
+float zeroLiving = 1.65;
+float zeroOffice = 1.65;
+bool livingroomtouchswitchstate=false;
+bool kitchenroomtouchswitchstate=false;
+bool officeroomtouchswitchstate=false;
+
+
+ZMPT101B voltageSensor(ZMPT_PIN, 50.0);
+float getACCurrent(int pin, float zeroVoltage = 1.65);
+
+void setup() {
+  Serial.begin(115200);
+
+  pinMode(RELAY_PIN, OUTPUT);
+  pinMode(EARTHRELAY_PIN, OUTPUT);
+  pinMode(ROOM1_RELAY_PIN, OUTPUT);
+  pinMode(ROOM2_RELAY_PIN, OUTPUT);
+  pinMode(ROOM3_RELAY_PIN, OUTPUT);
+
+  digitalWrite(RELAY_PIN, LOW);
+  digitalWrite(EARTHRELAY_PIN, LOW);
+  digitalWrite(ROOM1_RELAY_PIN, LOW);
+  digitalWrite(ROOM2_RELAY_PIN, LOW);
+  digitalWrite(ROOM3_RELAY_PIN, LOW);
+
+  zeroKitchen = calibrateACS712(ROOM1CURRENTSENSOR, "Kitchen");
+  zeroLiving  = calibrateACS712(ROOM2CURRENTSENSOR, "Living");
+  zeroOffice  = calibrateACS712(ROOM3CURRENTSENSOR, "Office");
+
+  voltageSensor.setSensitivity(ZMPT_SENSITIVITY);
+
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  Serial.print("Connecting to WiFi");
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println("\n✅ Connected to WiFi!");
+  online = 1;
+}
+
+void loop() {
+  float voltage = readVoltage();
+  float phaseCurrent = getACCurrent(ZMCT_PHASE_PIN, 1.65);  // Approx. midpoint
+  float neutralCurrent = getACCurrent(ZMCT_NEUTRAL_PIN, 1.65);
+  float totalCurrent = max(phaseCurrent, neutralCurrent);
+  float powerConsumption = calculatePower(voltage, totalCurrent);
+
+  float kitchenCurrent = getACCurrent(ROOM1CURRENTSENSOR, zeroKitchen);
+  float livingCurrent  = getACCurrent(ROOM2CURRENTSENSOR, zeroLiving);
+  float officeCurrent  = getACCurrent(ROOM3CURRENTSENSOR, zeroOffice);
+
+  // Firebase Dashboard
+  sendToFirebase("/dashboard/currentVoltage", voltage, FIREBASE_HOST, FIREBASE_AUTH);
+  sendToFirebase("/currentphase", phaseCurrent, FIREBASE_HOST, FIREBASE_AUTH);
+  sendToFirebase("/currentNeutral", neutralCurrent, FIREBASE_HOST, FIREBASE_AUTH);
+  sendToFirebase("/dashboard/powerConsumption", powerConsumption, FIREBASE_HOST, FIREBASE_AUTH);
+  sendToFirebase("/dashboard/powerStatus", powerstatus, FIREBASE_HOST, FIREBASE_AUTH);
+  sendToFirebase("/dashboard/online", online, FIREBASE_HOST, FIREBASE_AUTH);
+  sendToFirebase("/earthfault", earthfault, FIREBASE_HOST, FIREBASE_AUTH);
+
+  // Serial Monitor Output
+  Serial.println("--------- Live Data ---------");
+  Serial.print("Voltage: "); Serial.print(voltage); Serial.println(" V");
+  Serial.print("Phase Current: "); Serial.print(phaseCurrent); Serial.println(" A");
+  Serial.print("Neutral Current: "); Serial.print(neutralCurrent); Serial.println(" A");
+  Serial.print("Total Power: "); Serial.print(powerConsumption); Serial.println(" W");
+  Serial.println("-----------------------------");
+
+  kitchenRoom(voltage, kitchenCurrent);
+  livingRoom(voltage, livingCurrent);
+  officeRoom(voltage, officeCurrent);
+
+  handleOvervoltage(voltage);
+  handleUndervoltage(voltage);
+  RCCB(phaseCurrent, neutralCurrent);
+
+  roomOvercurrentProtection(ROOM1CURRENTSENSOR, ROOM1_RELAY_PIN, zeroKitchen);
+  roomOvercurrentProtection(ROOM2CURRENTSENSOR, ROOM2_RELAY_PIN, zeroLiving);
+  roomOvercurrentProtection(ROOM3CURRENTSENSOR, ROOM3_RELAY_PIN, zeroOffice);
+
+  delay(500);
+}
+
+float readVoltage() {
+  return voltageSensor.getRmsVoltage() * CALIBRATION_FACTOR;
+}
+
+
+
+//for calibrating acs 712 replace this code after done 
+float calibrateACS712(int pin, const char* label) {
+  long sum = 0;
+  for (int i = 0; i < 1000; i++) {
+    sum += analogRead(pin);
+    delayMicroseconds(100);
+  }
+  float avg = sum / 1000.0;
+  float voltage = avg * (3.3 / 4095.0);
+  Serial.print("✅ Calibrated "); Serial.print(label);
+  Serial.print(": Zero Voltage = "); Serial.println(voltage, 4);
+  return voltage;
+}
+
+
+//the above code is for acs712 replace this code 
+
+
+
+
+//from acs712 sensor
+float getACCurrent(int pin,float zeroVoltage) {
+
+  const int samples = 200;
+  float correction=1.644;
+  const float sensitivity = 0.066;
+  const float adcRef = 3.3;
+  const int adcMax = 4095;
+
+  float sumSquares = 0;
+  for (int i = 0; i < samples; i++) {
+    float voltage = analogRead(pin) * (adcRef / adcMax);
+    float current = (voltage - zeroVoltage) / sensitivity;
+    sumSquares += current * current;
+    delayMicroseconds(200);
+  }
+
+  float rms = sqrt(sumSquares / samples) * correction;
+  return (rms);
+}
+
+float calculatePower(float voltage, float current) {
+  float power = voltage * current;
+  powerstatus = (power >= 10);
+  return power;
+}
+
+// 🏠 Room Handlers
+void kitchenRoom(float voltage, float current) {
+ if(kitchenroomtouchswitchstate){
+   float power = current * voltage;
+  bool status = (power >= 0.5);
+ 
+
+  Serial.println("[Kitchen] Power: " + String(power) + " W | Current: " + String(current) + " A | Status: " + (status ? "ON" : "OFF"));
+  sendToFirebase("/rooms/kitchen/name", "Kitchen", FIREBASE_HOST, FIREBASE_AUTH);
+  sendToFirebase("/rooms/kitchen/power", power, FIREBASE_HOST, FIREBASE_AUTH);
+  sendToFirebase("/rooms/kitchen/status", status, FIREBASE_HOST, FIREBASE_AUTH);
+  sendToFirebase("/rooms/kitchen/kitchencurrent", current, FIREBASE_HOST, FIREBASE_AUTH);
+ }
+ else{
+  float power=0;
+ bool status = 0;
+ float current=0;
+kitchenroomtouchswitchstate=false;
+ Serial.println("[Kitchen] Power: " + String(power) + " W | Current: " + String(current) + " A | Status: " + (status ? "ON" : "OFF"));
+  sendToFirebase("/rooms/kitchen/name", "Kitchen", FIREBASE_HOST, FIREBASE_AUTH);
+  sendToFirebase("/rooms/kitchen/power", power, FIREBASE_HOST, FIREBASE_AUTH);
+  sendToFirebase("/rooms/kitchen/status", status, FIREBASE_HOST, FIREBASE_AUTH);
+  sendToFirebase("/rooms/kitchen/kitchencurrent", current, FIREBASE_HOST, FIREBASE_AUTH);
+
+ }
+}
+
+
+
+
+void livingRoom(float voltage, float current) {
+
+ if(livingroomtouchswitchstate){
+float power = current * voltage;
+ 
+  bool status = (power >= 0.5);
+
+  Serial.println("[Living] Power: " + String(power) + " W | Current: " + String(current) + " A | Status: " + (status ? "ON" : "OFF"));
+  sendToFirebase("/rooms/living/name", "Living", FIREBASE_HOST, FIREBASE_AUTH);
+  sendToFirebase("/rooms/living/power", power, FIREBASE_HOST, FIREBASE_AUTH);
+  sendToFirebase("/rooms/living/status", status, FIREBASE_HOST, FIREBASE_AUTH);
+  sendToFirebase("/rooms/living/livingcurrent", current, FIREBASE_HOST, FIREBASE_AUTH);
+ }else{
+ float power=0;
+ bool status = 0;
+ float current=0;
+livingroomtouchswitchstate=false;
+ 
+  Serial.println("[Living] Power: " + String(power) + " W | Current: " + String(current) + " A | Status: " + (status ? "ON" : "OFF"));
+  sendToFirebase("/rooms/living/name", "Living", FIREBASE_HOST, FIREBASE_AUTH);
+  sendToFirebase("/rooms/living/power", power, FIREBASE_HOST, FIREBASE_AUTH);
+  sendToFirebase("/rooms/living/status", status, FIREBASE_HOST, FIREBASE_AUTH);
+  sendToFirebase("/rooms/living/livingcurrent", current, FIREBASE_HOST, FIREBASE_AUTH);
+ }
+
+
+}
+
+
+
+
+void officeRoom(float voltage, float current) {
+  if(officeroomtouchswitchstate){
+   float power = current * voltage;
+  bool status = (power >= 0.5);
+  Serial.println("[Office] Power: " + String(power) + " W | Current: " + String(current) + " A | Status: " + (status ? "ON" : "OFF"));
+  sendToFirebase("/rooms/office/name", "Office", FIREBASE_HOST, FIREBASE_AUTH);
+  sendToFirebase("/rooms/office/power", power, FIREBASE_HOST, FIREBASE_AUTH);
+  sendToFirebase("/rooms/office/status", status, FIREBASE_HOST, FIREBASE_AUTH);
+  sendToFirebase("/rooms/office/officecurrent", current, FIREBASE_HOST, FIREBASE_AUTH); 
+  }else{
+   float power=0;
+ bool status = 0;
+ float current=0;
+  officeroomtouchswitchstate=false;
+  Serial.println("[Office] Power: " + String(power) + " W | Current: " + String(current) + " A | Status: " + (status ? "ON" : "OFF"));
+  sendToFirebase("/rooms/office/name", "Office", FIREBASE_HOST, FIREBASE_AUTH);
+  sendToFirebase("/rooms/office/power", power, FIREBASE_HOST, FIREBASE_AUTH);
+  sendToFirebase("/rooms/office/status", status, FIREBASE_HOST, FIREBASE_AUTH);
+  sendToFirebase("/rooms/office/officecurrent", current, FIREBASE_HOST, FIREBASE_AUTH);
+  }
+}
+
+// ⚠️ Protection
+void handleOvervoltage(float voltage) {
+  if (voltage > OVERVOLTAGE_LIMIT) {
+    digitalWrite(RELAY_PIN, HIGH);
+    overvoltageCount++;
+    Serial.println("⚠️ Overvoltage Detected!");
+    sendToFirebase("/OvervoltageCount", overvoltageCount, FIREBASE_HOST, FIREBASE_AUTH);
+  } else {
+    digitalWrite(RELAY_PIN, LOW);
+  }
+}
+
+void handleUndervoltage(float voltage) {
+  if (voltage < UNDERVOLTAGE_LIMIT) {
+    digitalWrite(RELAY_PIN, HIGH);
+    undervoltageCount++;
+    Serial.println("⚠️ Undervoltage Detected!");
+    sendToFirebase("/UndervoltageCount", undervoltageCount, FIREBASE_HOST, FIREBASE_AUTH);
+  } else {
+    digitalWrite(RELAY_PIN, LOW);
+  }
+}
+
+void RCCB(float phaseCurrent, float neutralCurrent) {
+  float diff = abs(phaseCurrent - neutralCurrent);
+  if (diff > LEAKAGE_THRESHOLD) {
+    Serial.println("⚠️ Earth Leakage Detected!");
+    digitalWrite(EARTHRELAY_PIN, HIGH);
+    earthfault = true;
+    sendToFirebase("/LeakageCurrent", diff, FIREBASE_HOST, FIREBASE_AUTH);
+  }
+}
+
+// 🔐 Overcurrent Protection Per Room
+void roomOvercurrentProtection(int sensorPin, int relayPin,float zeroVoltage) {
+  float rms = getACCurrent(sensorPin,zeroVoltage);
+  static bool isTripped = false;
+  static unsigned long tripTime = 0;
+  const float threshold = 0.96f;
+
+  if (rms >= threshold && !isTripped) {
+    digitalWrite(relayPin, HIGH);
+    isTripped = true;
+    tripTime = millis();
+    Serial.println("🔥 Overcurrent! Room TRIPPED at " + String(rms) + " A");
+  }
+
+  if (isTripped && millis() - tripTime > 2000 && rms < threshold * 0.5) {
+    digitalWrite(relayPin, LOW);
+    isTripped = false;
+    Serial.println("✅ Room auto-reset.");
+  }
+}
+
+// 📤 Firebase Functions
+bool sendToFirebase(const char* path, float value, const char* host, const char* auth) {
+  if (WiFi.status() != WL_CONNECTED) return false;
+  HTTPClient http;
+  String url = "https://" + String(host) + path + ".json?auth=" + String(auth);
+  String payload = String(value, 2);
+  http.begin(url); http.addHeader("Content-Type", "application/json");
+  int code = http.PUT(payload); http.end();
+  return code == 200;
+}
+
+bool sendToFirebase(const char* path, const char* value, const char* host, const char* auth) {
+  if (WiFi.status() != WL_CONNECTED) return false;
+  HTTPClient http;
+  String url = "https://" + String(host) + path + ".json?auth=" + String(auth);
+  String payload = "\"" + String(value) + "\"";
+  http.begin(url); http.addHeader("Content-Type", "application/json");
+  int code = http.PUT(payload); http.end();
+  return code == 200;
+}  
