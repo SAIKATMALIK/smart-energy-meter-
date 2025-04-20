@@ -1,0 +1,274 @@
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <ArduinoJson.h>
+#include <ZMPT101B.h>
+#include <math.h>
+
+// === LCD ===
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+
+// === Voltage Sensor ===
+#define ZMPT_PIN 33
+#define ZMPT_SENSITIVITY 500.0f
+#define VOLTAGE_CALIBRATION 1.49
+ZMPT101B voltageSensor(ZMPT_PIN, 50.0);
+
+// === ZMCT103C Current Sensors ===
+#define ZMCT_EARTH_PIN 36
+const float ZMCT_CALIBRATION = 0.05;
+const float ZMCT_VREF = 3.3;
+const int ZMCT_ADC_RES = 4095;
+float earthOffset = 0.0;
+bool earthfault=0;
+// === ACS712 Sensors ===
+#define ROOM1CURRENTSENSOR 34  // Kitchen
+#define ROOM2CURRENTSENSOR 35  // Living
+#define ROOM3CURRENTSENSOR 32  // Office
+
+float zeroKitchen = 1.65;
+float zeroLiving = 1.65;
+float zeroOffice = 1.65;
+
+// === Relay Pins ===
+#define RELAY_PIN 18
+#define EARTHRELAY_PIN 15
+#define ROOM1_RELAY_PIN 26
+#define ROOM2_RELAY_PIN 27
+#define ROOM3_RELAY_PIN 14
+
+// === Thresholds ===
+#define OVERVOLTAGE_LIMIT 260.0
+#define UNDERVOLTAGE_LIMIT 150.0
+#define LEAKAGE_THRESHOLD 0.3
+#define ACS_SENSITIVITY 0.042
+#define ROOM_OVERCURRENT_LIMIT 0.6
+
+// === States ===
+
+bool powerstatus = true;
+bool room1status = false;
+bool room2status = false;
+bool room3status = false;
+
+
+bool room1OvercurrentFault = false;
+bool room2OvercurrentFault = false;
+bool room3OvercurrentFault = false;
+
+
+String inputCommand = "";
+
+void setup() {
+  Serial.begin(115200);
+  Wire.begin(21, 22);
+  lcd.init();
+  lcd.backlight();
+  lcd.print("Calibrating...");
+
+  pinMode(RELAY_PIN, OUTPUT);
+  pinMode(EARTHRELAY_PIN, OUTPUT);
+  pinMode(ROOM1_RELAY_PIN, OUTPUT);
+  pinMode(ROOM2_RELAY_PIN, OUTPUT);
+  pinMode(ROOM3_RELAY_PIN, OUTPUT);
+
+  digitalWrite(RELAY_PIN, LOW);
+  digitalWrite(EARTHRELAY_PIN, LOW);
+  digitalWrite(ROOM1_RELAY_PIN, HIGH);
+  digitalWrite(ROOM2_RELAY_PIN, HIGH);
+  digitalWrite(ROOM3_RELAY_PIN, HIGH);
+
+  voltageSensor.setSensitivity(ZMPT_SENSITIVITY);
+  analogSetAttenuation(ADC_11db); // for ESP32 full range
+
+  earthOffset = calibrateearthCT(ZMCT_EARTH_PIN);
+  zeroKitchen = calibrateACS712(ROOM1CURRENTSENSOR, "Kitchen");
+  zeroLiving = calibrateACS712(ROOM2CURRENTSENSOR, "Living");
+  zeroOffice = calibrateACS712(ROOM3CURRENTSENSOR, "Office");
+
+  lcd.clear();
+  lcd.print("System Ready");
+  delay(1000);
+}
+
+void loop() {
+  handleSerialInput();
+
+  float voltage = readVoltage();
+  bool voltageOK = voltage >= UNDERVOLTAGE_LIMIT && voltage <= OVERVOLTAGE_LIMIT;
+
+  float kitchenCurrent = (room1status && voltageOK) ? getACCurrent(ROOM1CURRENTSENSOR, zeroKitchen) : 0.0;
+  float livingCurrent  = (room2status && voltageOK) ? getACCurrent(ROOM2CURRENTSENSOR, zeroLiving) : 0.0;
+  float officeCurrent  = (room3status && voltageOK) ? getACCurrent(ROOM3CURRENTSENSOR, zeroOffice) : 0.0;
+
+  float earthcurrent = getearthRMSCurrent(ZMCT_EARTH_PIN, earthOffset) * 18.0;
+
+  // Protection
+  handleOvervoltage(voltage);
+  handleUndervoltage(voltage);
+  RCCB(earthcurrent);
+
+  // Room Protection
+  controlRoomRelay(room1status, kitchenCurrent, voltage, ROOM1_RELAY_PIN, "Kitchen", room1OvercurrentFault);
+controlRoomRelay(room2status, livingCurrent, voltage, ROOM2_RELAY_PIN, "Living", room2OvercurrentFault);
+controlRoomRelay(room3status, officeCurrent, voltage, ROOM3_RELAY_PIN, "Office", room3OvercurrentFault);
+
+
+  // LCD Display
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.printf("V:%.0f K:%.1f", voltage, kitchenCurrent);
+  lcd.setCursor(0, 1);
+  lcd.printf("L:%.1f O:%.1f", livingCurrent, officeCurrent);
+
+  // Debug Info
+  Serial.println("====== LIVE DATA ======");
+  Serial.printf("Voltage: %.2f V\n", voltage);
+  Serial.printf("Kitchen Current: %.2f A\n", kitchenCurrent);
+  Serial.printf("Living Current: %.2f A\n", livingCurrent);
+  Serial.printf("Office Current: %.2f A\n", officeCurrent);
+  Serial.printf("Earth Leakage: %.2f A\n", earthcurrent);
+  Serial.println("========================\n");
+
+  delay(500);
+}
+
+
+// --- Serial Control ---
+void handleSerialInput() {
+  while (Serial.available()) {
+    char c = Serial.read();
+    if (c == '\n') {
+      inputCommand.trim();
+      inputCommand.toUpperCase();
+
+      if (inputCommand == "ROOM1 ON") room1status = true;
+      else if (inputCommand == "ROOM1 OFF") room1status = false;
+      else if (inputCommand == "ROOM2 ON") room2status = true;
+      else if (inputCommand == "ROOM2 OFF") room2status = false;
+      else if (inputCommand == "ROOM3 ON") room3status = true;
+      else if (inputCommand == "ROOM3 OFF") room3status = false;
+
+      Serial.print("✅ Command: "); Serial.println(inputCommand);
+      inputCommand = "";
+    } else {
+      inputCommand += c;
+    }
+  }
+}
+
+// --- Sensor Calibrations ---
+float calibrateearthCT(int pin) {
+  long sum = 0;
+  const int samples = 1000;
+  for (int i = 0; i < samples; i++) {
+    sum += analogRead(pin);
+    delay(1);
+  }
+  return sum / (float)samples;
+}
+
+float getearthRMSCurrent(int pin, float offset) {
+  long sumSq = 0;
+  const int samples = 200;
+  for (int i = 0; i < samples; i++) {
+    int raw = analogRead(pin);
+    float voltage = (raw - offset) * (ZMCT_VREF / ZMCT_ADC_RES);
+    sumSq += voltage * voltage;
+    delay(1);
+  }
+  float rmsVoltage = sqrt(sumSq / (float)samples);
+  return rmsVoltage * ZMCT_CALIBRATION;
+}
+
+float readVoltage() {
+ float voltage=voltageSensor.getRmsVoltage() * VOLTAGE_CALIBRATION;
+  if(voltage<20){
+    voltage=0;
+  }
+  return voltage;
+}
+
+float calibrateACS712(int pin, const char* label) {
+  long sum = 0;
+  for (int i = 0; i < 1000; i++) {
+    sum += analogRead(pin);
+    delayMicroseconds(100);
+  }
+  float avg = sum / 1000.0;
+  float voltage = avg * (3.3 / 4095.0);
+  Serial.print("✅ Calibrated "); Serial.print(label);
+  Serial.print(": Zero Voltage = "); Serial.println(voltage, 4);
+  return voltage;
+}
+
+float getACCurrent(int pin, float zeroVoltage) {
+  const int samples = 200;
+  float sumSq = 0.0;
+
+  for (int i = 0; i < samples; i++) {
+    float voltage = analogRead(pin) * (3.3 / 4095.0);
+    float current = (voltage - zeroVoltage) / ACS_SENSITIVITY;
+    sumSq += current * current;
+    delayMicroseconds(200);
+  }
+
+
+  return sqrt(sumSq / samples);
+}
+
+// --- Protection Logic ---
+void RCCB(float earthcurrent) {
+  if (!earthfault && earthcurrent > LEAKAGE_THRESHOLD) {
+    earthfault = true; // latch the fault
+    digitalWrite(EARTHRELAY_PIN, HIGH);
+    Serial.println("⚠️ RCCB TRIPPED!");
+  }
+
+  if (earthfault) {
+    digitalWrite(EARTHRELAY_PIN, HIGH); // keep it tripped
+  }
+}
+
+
+void handleOvervoltage(float voltage) {
+  if (voltage > 260) {
+    digitalWrite(EARTHRELAY_PIN, HIGH);
+    Serial.println("⚠️ Overvoltage Detected!");
+  } else {
+    digitalWrite(EARTHRELAY_PIN, LOW);
+  }
+}
+
+void handleUndervoltage(float voltage) {
+  if (voltage < 150) {
+    digitalWrite(EARTHRELAY_PIN, HIGH);
+    Serial.println("⚠️ Undervoltage Detected!");
+  }
+  else {
+    digitalWrite(EARTHRELAY_PIN, LOW);
+  }
+}
+
+// --- Relay Control ---
+// Global flags for each room — define one for each room
+ // example for Room 1
+
+void controlRoomRelay(bool roomStatus, float current, float voltage, int relayPin, const char* roomName, bool &overcurrentFault) {
+  if (!overcurrentFault && roomStatus && current < ROOM_OVERCURRENT_LIMIT && voltage >= UNDERVOLTAGE_LIMIT && voltage <= OVERVOLTAGE_LIMIT) {
+    digitalWrite(relayPin, LOW); // relay ON (normal operation)
+  } else {
+    // Latch fault if overcurrent detected
+    if (current > ROOM_OVERCURRENT_LIMIT) {
+      overcurrentFault = true;
+      Serial.printf("⚠️ Overcurrent TRIPPED in %s\n", roomName);
+    }
+
+    digitalWrite(relayPin, HIGH); // relay OFF (trip)
+
+    if (!roomStatus) Serial.printf("ℹ️ %s OFF from Serial\n", roomName);
+    else if (overcurrentFault) Serial.printf("⚠️ %s REMAINS TRIPPED (overcurrent)\n", roomName);
+    else Serial.printf("⚠️ Voltage issue in %s\n", roomName);
+  }
+}
